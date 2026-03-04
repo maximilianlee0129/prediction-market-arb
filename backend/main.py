@@ -9,6 +9,7 @@ Run: cd backend && uvicorn main:app --reload
 Or standalone poller: python -m backend.main
 """
 import asyncio
+import gc
 import json
 import os
 from contextlib import asynccontextmanager
@@ -165,11 +166,11 @@ async def run_market_matching(
         matched_kalshi_ids = {p.kalshi_market_id for p in existing_pairs}
         matched_poly_ids = {p.poly_market_id for p in existing_pairs}
 
-        # Get DB ID mapping: (platform, platform_id) → market.id
-        all_markets = (
-            await session.execute(select(Market))
-        ).scalars().all()
-        id_lookup = {(m.platform, m.platform_id): m.id for m in all_markets}
+        # Get DB ID mapping: (platform, platform_id) → market.id (3 columns only, not full ORM)
+        result = await session.execute(
+            select(Market.id, Market.platform, Market.platform_id)
+        )
+        id_lookup = {(r.platform, r.platform_id): r.id for r in result.all()}
 
     # Filter out already-matched markets
     unmatched_kalshi = [
@@ -346,11 +347,6 @@ async def detect_arbs() -> list[dict]:
 
 # ── Polling loop (upgraded from Phase 1) ─────────────────────────────────────
 
-# Keep last-fetched market data in memory for matching
-_last_kalshi: list[dict] = []
-_last_poly: list[dict] = []
-
-
 async def fetch_markets() -> tuple[list[dict], list[dict]]:
     """Fetch from both APIs, handle errors, return (kalshi, poly)."""
     kalshi_markets, poly_markets = await asyncio.gather(
@@ -373,7 +369,6 @@ async def poll_loop() -> None:
     - Full market refresh + matching every 5 minutes (also on startup)
     - Price refresh + arb detection every 30 seconds
     """
-    global _last_kalshi, _last_poly
     cycle = 0
     market_refresh_interval = settings.market_poll_seconds // settings.price_poll_seconds
 
@@ -384,23 +379,25 @@ async def poll_loop() -> None:
                 logger.info("Full market refresh + matching...")
                 k_markets, p_markets = await fetch_markets()
 
-                all_markets = k_markets + p_markets
-                if all_markets:
-                    inserted, updated = await upsert_markets(all_markets)
-                    logger.info(
-                        f"Market refresh: {len(k_markets)} Kalshi + "
-                        f"{len(p_markets)} Polymarket "
-                        f"({inserted} new, {updated} updated)"
-                    )
+                if k_markets:
+                    ins_k, upd_k = await upsert_markets(k_markets)
+                    logger.info(f"Kalshi: {len(k_markets)} markets ({ins_k} new, {upd_k} updated)")
+                if p_markets:
+                    ins_p, upd_p = await upsert_markets(p_markets)
+                    logger.info(f"Polymarket: {len(p_markets)} markets ({ins_p} new, {upd_p} updated)")
 
+                if k_markets and p_markets:
                     _print_top_markets("KALSHI", k_markets)
                     _print_top_markets("POLYMARKET", p_markets)
 
                     # Run matching on new unmatched markets
-                    _last_kalshi, _last_poly = k_markets, p_markets
                     new_pairs = await run_market_matching(k_markets, p_markets)
                     if new_pairs:
                         logger.info(f"New matched pairs: {new_pairs}")
+
+                # Free large market lists — no longer needed
+                del k_markets, p_markets
+                gc.collect()
 
                 # Run arb detection on all matched pairs
                 opps = await detect_arbs()
@@ -417,10 +414,15 @@ async def poll_loop() -> None:
                 logger.info(f"Price refresh cycle {cycle}...")
                 k_markets, p_markets = await fetch_markets()
 
-                all_markets = k_markets + p_markets
-                if all_markets:
-                    inserted, updated = await upsert_markets(all_markets)
-                    logger.info(f"Price refresh: {updated} updated, {inserted} new")
+                if k_markets:
+                    ins_k, upd_k = await upsert_markets(k_markets)
+                    logger.info(f"Price refresh: Kalshi {upd_k} updated, {ins_k} new")
+                if p_markets:
+                    ins_p, upd_p = await upsert_markets(p_markets)
+                    logger.info(f"Price refresh: Polymarket {upd_p} updated, {ins_p} new")
+
+                del k_markets, p_markets
+                gc.collect()
 
                 # Re-scan for arbs with fresh prices
                 opps = await detect_arbs()
