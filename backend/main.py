@@ -347,20 +347,17 @@ async def detect_arbs() -> list[dict]:
 
 # ── Polling loop (upgraded from Phase 1) ─────────────────────────────────────
 
-async def fetch_markets() -> tuple[list[dict], list[dict]]:
-    """Fetch from both APIs, handle errors, return (kalshi, poly)."""
-    kalshi_markets, poly_markets = await asyncio.gather(
-        kalshi.fetch_all_markets(),
-        polymarket.fetch_all_markets(),
-        return_exceptions=True,
-    )
-    if isinstance(kalshi_markets, Exception):
-        logger.error(f"Kalshi fetch failed: {kalshi_markets}")
-        kalshi_markets = []
-    if isinstance(poly_markets, Exception):
-        logger.error(f"Polymarket fetch failed: {poly_markets}")
-        poly_markets = []
-    return kalshi_markets, poly_markets
+async def _fetch_and_upsert(collector, platform: str) -> list[dict]:
+    """Fetch markets from one platform, upsert to DB, return the list."""
+    try:
+        markets = await collector.fetch_all_markets()
+    except Exception as e:
+        logger.error(f"{platform} fetch failed: {e}")
+        return []
+    if markets:
+        ins, upd = await upsert_markets(markets)
+        logger.info(f"{platform}: {len(markets)} markets ({ins} new, {upd} updated)")
+    return markets
 
 
 async def poll_loop() -> None:
@@ -368,70 +365,60 @@ async def poll_loop() -> None:
     Main polling loop:
     - Full market refresh + matching every 5 minutes (also on startup)
     - Price refresh + arb detection every 30 seconds
+
+    Fetches platforms sequentially (not in parallel) to keep peak RAM low.
     """
     cycle = 0
     market_refresh_interval = settings.market_poll_seconds // settings.price_poll_seconds
 
     while True:
         try:
-            if cycle % market_refresh_interval == 0:
-                # Full refresh — fetch, upsert, match
+            is_full_refresh = cycle % market_refresh_interval == 0
+            if is_full_refresh:
                 logger.info("Full market refresh + matching...")
-                k_markets, p_markets = await fetch_markets()
-
-                if k_markets:
-                    ins_k, upd_k = await upsert_markets(k_markets)
-                    logger.info(f"Kalshi: {len(k_markets)} markets ({ins_k} new, {upd_k} updated)")
-                if p_markets:
-                    ins_p, upd_p = await upsert_markets(p_markets)
-                    logger.info(f"Polymarket: {len(p_markets)} markets ({ins_p} new, {upd_p} updated)")
-
-                if k_markets and p_markets:
-                    _print_top_markets("KALSHI", k_markets)
-                    _print_top_markets("POLYMARKET", p_markets)
-
-                    # Run matching on new unmatched markets
-                    new_pairs = await run_market_matching(k_markets, p_markets)
-                    if new_pairs:
-                        logger.info(f"New matched pairs: {new_pairs}")
-
-                # Free large market lists — no longer needed
-                del k_markets, p_markets
-                gc.collect()
-
-                # Run arb detection on all matched pairs
-                opps = await detect_arbs()
-                if opps:
-                    _print_opportunities(opps)
-                    await manager.broadcast({
-                        "type": "opportunities",
-                        "data": opps,
-                        "count": len(opps),
-                    })
-
             else:
-                # Price-only refresh + arb scan
                 logger.info(f"Price refresh cycle {cycle}...")
-                k_markets, p_markets = await fetch_markets()
 
-                if k_markets:
-                    ins_k, upd_k = await upsert_markets(k_markets)
-                    logger.info(f"Price refresh: Kalshi {upd_k} updated, {ins_k} new")
-                if p_markets:
-                    ins_p, upd_p = await upsert_markets(p_markets)
-                    logger.info(f"Price refresh: Polymarket {upd_p} updated, {ins_p} new")
+            # Sequential fetch+upsert to halve peak RAM
+            k_markets = await _fetch_and_upsert(kalshi, "Kalshi")
+            p_markets = await _fetch_and_upsert(polymarket, "Polymarket")
 
+            if is_full_refresh and k_markets and p_markets:
+                _print_top_markets("KALSHI", k_markets)
+                _print_top_markets("POLYMARKET", p_markets)
+
+                # Slim dicts to only what the matcher needs — title + ids + volume
+                k_slim = [{"platform_id": m["platform_id"], "title": m["title"],
+                           "category": m.get("category", ""), "volume": m.get("volume", 0)}
+                          for m in k_markets]
+                p_slim = [{"platform_id": m["platform_id"], "title": m["title"],
+                           "category": m.get("category", ""), "volume": m.get("volume", 0)}
+                          for m in p_markets]
+
+                # Free full lists before matching
                 del k_markets, p_markets
                 gc.collect()
 
-                # Re-scan for arbs with fresh prices
-                opps = await detect_arbs()
-                if opps:
-                    await manager.broadcast({
-                        "type": "opportunities",
-                        "data": opps,
-                        "count": len(opps),
-                    })
+                new_pairs = await run_market_matching(k_slim, p_slim)
+                del k_slim, p_slim
+                gc.collect()
+
+                if new_pairs:
+                    logger.info(f"New matched pairs: {new_pairs}")
+            else:
+                del k_markets, p_markets
+                gc.collect()
+
+            # Arb detection on all matched pairs
+            opps = await detect_arbs()
+            if opps:
+                if is_full_refresh:
+                    _print_opportunities(opps)
+                await manager.broadcast({
+                    "type": "opportunities",
+                    "data": opps,
+                    "count": len(opps),
+                })
 
         except Exception as e:
             logger.error(f"Poll loop error: {e}", exc_info=True)

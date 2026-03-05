@@ -6,7 +6,6 @@ Prices come as dollar strings ("0.6500") already on 0-1 scale.
 Cursor-based pagination, up to 1000 per page.
 """
 import asyncio
-import json
 import random
 import time
 from datetime import datetime
@@ -172,7 +171,6 @@ class KalshiCollector:
             "close_time": close_time,
             "status": raw.get("status", "open"),
             "outcome_count": 2,  # Kalshi markets are binary
-            "raw_data": json.dumps(raw),
         }
 
 

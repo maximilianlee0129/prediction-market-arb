@@ -205,7 +205,6 @@ class PolymarketCollector:
             "outcome_count": 2,
             "clob_token_id_yes": token_yes,
             "clob_token_id_no": token_no,
-            "raw_data": json.dumps(raw),
         }
 
 
