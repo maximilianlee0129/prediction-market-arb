@@ -10,14 +10,14 @@ Or standalone poller: python -m backend.main
 """
 import asyncio
 import gc
-import json
 import os
 from contextlib import asynccontextmanager
 from datetime import datetime
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from sqlalchemy import select, update, func
+from sqlalchemy import select, func
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
 from backend.config import settings
 from backend.database import init_db, AsyncSessionLocal
@@ -43,14 +43,15 @@ polymarket = PolymarketCollector()
 
 # ── Market upsert (unchanged from Phase 1) ──────────────────────────────────
 
-async def upsert_markets(markets: list[dict]) -> tuple[int, int]:
-    """Insert new markets or update existing ones. Returns (inserted, updated).
+async def upsert_markets(markets: list[dict]) -> int:
+    """Bulk upsert markets using INSERT OR REPLACE. Returns total processed.
 
-    Optimized: loads existing keys into memory first, then batches writes
-    with periodic commits to avoid holding a huge transaction.
+    Uses SQLite's INSERT ... ON CONFLICT DO UPDATE (one SQL statement per
+    batch of 500) instead of individual INSERT/UPDATE per row — much faster
+    when most rows already exist.
     """
     if not markets:
-        return 0, 0
+        return 0
 
     import time
     t0 = time.monotonic()
@@ -61,75 +62,59 @@ async def upsert_markets(markets: list[dict]) -> tuple[int, int]:
         seen[(m["platform"], m["platform_id"])] = idx
     markets = [markets[i] for i in sorted(seen.values())]
 
-    inserted = 0
-    updated = 0
     BATCH_SIZE = 500
     now = datetime.utcnow()
 
     async with AsyncSessionLocal() as session:
-        # Load all existing (platform, platform_id) → id into memory
-        result = await session.execute(
-            select(Market.id, Market.platform, Market.platform_id)
-        )
-        existing_map = {(r.platform, r.platform_id): r.id for r in result.all()}
-        logger.info(f"Loaded {len(existing_map)} existing market keys in {time.monotonic()-t0:.1f}s")
-
         for i in range(0, len(markets), BATCH_SIZE):
             batch = markets[i:i + BATCH_SIZE]
 
-            for m in batch:
-                key = (m["platform"], m["platform_id"])
-                existing_id = existing_map.get(key)
+            values = [
+                {
+                    "platform": m["platform"],
+                    "platform_id": m["platform_id"],
+                    "event_id": m.get("event_id", ""),
+                    "title": m["title"],
+                    "category": m.get("category", ""),
+                    "yes_price": m["yes_price"],
+                    "no_price": m["no_price"],
+                    "yes_bid": m["yes_bid"],
+                    "yes_ask": m["yes_ask"],
+                    "no_bid": m["no_bid"],
+                    "no_ask": m["no_ask"],
+                    "volume": m["volume"],
+                    "volume_24h": m["volume_24h"],
+                    "liquidity": m["liquidity"],
+                    "open_interest": m.get("open_interest", 0),
+                    "close_time": m.get("close_time"),
+                    "status": m["status"],
+                    "outcome_count": m.get("outcome_count", 2),
+                    "clob_token_id_yes": m.get("clob_token_id_yes"),
+                    "clob_token_id_no": m.get("clob_token_id_no"),
+                    "last_updated": now,
+                }
+                for m in batch
+            ]
 
-                if existing_id:
-                    await session.execute(
-                        update(Market)
-                        .where(Market.id == existing_id)
-                        .values(
-                            yes_price=m["yes_price"],
-                            no_price=m["no_price"],
-                            yes_bid=m["yes_bid"],
-                            yes_ask=m["yes_ask"],
-                            no_bid=m["no_bid"],
-                            no_ask=m["no_ask"],
-                            volume=m["volume"],
-                            volume_24h=m["volume_24h"],
-                            liquidity=m["liquidity"],
-                            open_interest=m.get("open_interest", 0),
-                            status=m["status"],
-                            last_updated=now,
-                        )
-                    )
-                    updated += 1
-                else:
-                    new_market = Market(
-                        platform=m["platform"],
-                        platform_id=m["platform_id"],
-                        event_id=m.get("event_id", ""),
-                        title=m["title"],
-                        category=m.get("category", ""),
-                        yes_price=m["yes_price"],
-                        no_price=m["no_price"],
-                        yes_bid=m["yes_bid"],
-                        yes_ask=m["yes_ask"],
-                        no_bid=m["no_bid"],
-                        no_ask=m["no_ask"],
-                        volume=m["volume"],
-                        volume_24h=m["volume_24h"],
-                        liquidity=m["liquidity"],
-                        open_interest=m.get("open_interest", 0),
-                        close_time=m.get("close_time"),
-                        status=m["status"],
-                        outcome_count=m.get("outcome_count", 2),
-                        clob_token_id_yes=m.get("clob_token_id_yes"),
-                        clob_token_id_no=m.get("clob_token_id_no"),
-                        raw_data=m.get("raw_data"),
-                        last_updated=now,
-                    )
-                    session.add(new_market)
-                    inserted += 1
-
-            # Commit each batch to avoid huge transactions
+            stmt = sqlite_insert(Market).values(values)
+            stmt = stmt.on_conflict_do_update(
+                index_elements=["platform", "platform_id"],
+                set_={
+                    "yes_price": stmt.excluded.yes_price,
+                    "no_price": stmt.excluded.no_price,
+                    "yes_bid": stmt.excluded.yes_bid,
+                    "yes_ask": stmt.excluded.yes_ask,
+                    "no_bid": stmt.excluded.no_bid,
+                    "no_ask": stmt.excluded.no_ask,
+                    "volume": stmt.excluded.volume,
+                    "volume_24h": stmt.excluded.volume_24h,
+                    "liquidity": stmt.excluded.liquidity,
+                    "open_interest": stmt.excluded.open_interest,
+                    "status": stmt.excluded.status,
+                    "last_updated": stmt.excluded.last_updated,
+                },
+            )
+            await session.execute(stmt)
             await session.commit()
 
             processed = i + len(batch)
@@ -139,8 +124,8 @@ async def upsert_markets(markets: list[dict]) -> tuple[int, int]:
                 logger.info(f"Upsert progress: {processed}/{len(markets)} ({rate:.0f}/s)")
 
     elapsed = time.monotonic() - t0
-    logger.info(f"Upsert complete: {inserted} new + {updated} updated in {elapsed:.1f}s")
-    return inserted, updated
+    logger.info(f"Upsert complete: {len(markets)} markets in {elapsed:.1f}s")
+    return len(markets)
 
 
 # ── Market matching (Phase 3) ────────────────────────────────────────────────
@@ -355,8 +340,8 @@ async def _fetch_and_upsert(collector, platform: str) -> list[dict]:
         logger.error(f"{platform} fetch failed: {e}")
         return []
     if markets:
-        ins, upd = await upsert_markets(markets)
-        logger.info(f"{platform}: {len(markets)} markets ({ins} new, {upd} updated)")
+        total = await upsert_markets(markets)
+        logger.info(f"{platform}: {total} markets upserted")
     return markets
 
 
