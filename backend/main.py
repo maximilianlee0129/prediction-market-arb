@@ -359,42 +359,41 @@ async def poll_loop() -> None:
     while True:
         try:
             is_full_refresh = cycle % market_refresh_interval == 0
+
             if is_full_refresh:
+                # Full refresh: fetch all markets, upsert, match new pairs
                 logger.info("Full market refresh + matching...")
+                k_markets = await _fetch_and_upsert(kalshi, "Kalshi")
+                p_markets = await _fetch_and_upsert(polymarket, "Polymarket")
+
+                if k_markets and p_markets:
+                    _print_top_markets("KALSHI", k_markets)
+                    _print_top_markets("POLYMARKET", p_markets)
+
+                    k_slim = [{"platform_id": m["platform_id"], "title": m["title"],
+                               "category": m.get("category", ""), "volume": m.get("volume", 0)}
+                              for m in k_markets]
+                    p_slim = [{"platform_id": m["platform_id"], "title": m["title"],
+                               "category": m.get("category", ""), "volume": m.get("volume", 0)}
+                              for m in p_markets]
+
+                    del k_markets, p_markets
+                    gc.collect()
+
+                    new_pairs = await run_market_matching(k_slim, p_slim)
+                    del k_slim, p_slim
+                    gc.collect()
+
+                    if new_pairs:
+                        logger.info(f"New matched pairs: {new_pairs}")
+                else:
+                    del k_markets, p_markets
+                    gc.collect()
             else:
-                logger.info(f"Price refresh cycle {cycle}...")
+                # Price refresh: skip full fetch — just re-scan arbs on current DB prices
+                logger.info(f"Arb scan cycle {cycle} (using stored prices)...")
 
-            # Sequential fetch+upsert to halve peak RAM
-            k_markets = await _fetch_and_upsert(kalshi, "Kalshi")
-            p_markets = await _fetch_and_upsert(polymarket, "Polymarket")
-
-            if is_full_refresh and k_markets and p_markets:
-                _print_top_markets("KALSHI", k_markets)
-                _print_top_markets("POLYMARKET", p_markets)
-
-                # Slim dicts to only what the matcher needs — title + ids + volume
-                k_slim = [{"platform_id": m["platform_id"], "title": m["title"],
-                           "category": m.get("category", ""), "volume": m.get("volume", 0)}
-                          for m in k_markets]
-                p_slim = [{"platform_id": m["platform_id"], "title": m["title"],
-                           "category": m.get("category", ""), "volume": m.get("volume", 0)}
-                          for m in p_markets]
-
-                # Free full lists before matching
-                del k_markets, p_markets
-                gc.collect()
-
-                new_pairs = await run_market_matching(k_slim, p_slim)
-                del k_slim, p_slim
-                gc.collect()
-
-                if new_pairs:
-                    logger.info(f"New matched pairs: {new_pairs}")
-            else:
-                del k_markets, p_markets
-                gc.collect()
-
-            # Arb detection on all matched pairs
+            # Arb detection runs every cycle on whatever prices are in the DB
             opps = await detect_arbs()
             if opps:
                 if is_full_refresh:
