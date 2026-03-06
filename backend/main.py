@@ -360,13 +360,22 @@ async def detect_arbs() -> list[dict]:
 # ── Polling loop (upgraded from Phase 1) ─────────────────────────────────────
 
 async def _fetch_and_upsert(collector, platform: str) -> list[dict]:
-    """Fetch markets from one platform, upsert to DB, return the list."""
+    """Fetch markets from one platform, upsert to DB, return the list.
+
+    Only stores markets with volume >= MIN_VOLUME_FOR_MATCHING. Zero-volume
+    markets (e.g. Kalshi multi-leg combo bets with no activity) are never
+    candidates for matching and waste significant disk space.
+    """
+    from backend.matcher import MIN_VOLUME_FOR_MATCHING
     try:
         markets = await collector.fetch_all_markets()
     except Exception as e:
         logger.error(f"{platform} fetch failed: {e}")
         return []
     if markets:
+        before = len(markets)
+        markets = [m for m in markets if (m.get("volume") or 0) >= MIN_VOLUME_FOR_MATCHING]
+        logger.info(f"{platform}: filtered {before} → {len(markets)} markets (volume >= {MIN_VOLUME_FOR_MATCHING})")
         total = await upsert_markets(markets)
         logger.info(f"{platform}: {total} markets upserted")
     return markets
