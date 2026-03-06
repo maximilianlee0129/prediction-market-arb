@@ -393,6 +393,7 @@ async def poll_loop() -> None:
 
     Fetches platforms sequentially (not in parallel) to keep peak RAM low.
     """
+    global _kalshi_slim_cache
     cycle = 0
     market_refresh_interval = settings.market_poll_seconds // settings.price_poll_seconds
 
@@ -454,7 +455,6 @@ async def poll_loop() -> None:
 
                     # Update in-memory cache after a fresh successful collection
                     if is_fresh_kalshi:
-                        global _kalshi_slim_cache
                         _kalshi_slim_cache = k_slim
                         logger.info(f"Kalshi market cache updated: {len(_kalshi_slim_cache)} markets")
 
