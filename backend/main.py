@@ -552,7 +552,8 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Arb Scanner API", version="0.2.0", lifespan=lifespan)
-_allowed_origins = os.getenv("ALLOWED_ORIGINS", "http://localhost:3000").split(",")
+_allowed_origins_env = os.getenv("ALLOWED_ORIGINS", "*")
+_allowed_origins = _allowed_origins_env.split(",") if _allowed_origins_env != "*" else ["*"]
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_allowed_origins,
