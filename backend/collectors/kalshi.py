@@ -19,7 +19,7 @@ from backend.utils.logger import get_logger, log_api_call
 logger = get_logger(__name__)
 
 # Delay between pages to stay under rate limits
-PAGE_DELAY = 0.3  # seconds — halves request rate vs 0.15, avoids sustained 429s
+PAGE_DELAY = 0.8  # seconds — ~1.25 req/s, enough headroom under Kalshi rate limit
 
 
 class KalshiCollector:
