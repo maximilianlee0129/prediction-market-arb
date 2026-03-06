@@ -40,16 +40,16 @@ class KalshiCollector:
 
     async def _fetch_page(self, client: httpx.AsyncClient, path: str, params: dict) -> dict:
         """Fetch a single page with per-request retry on 429."""
-        for attempt in range(8):
+        for attempt in range(5):
             resp = await client.get(path, params=params)
             if resp.status_code == 429:
-                delay = min(1.0 * (2**attempt) + random.uniform(0, 1), 120.0)
+                delay = min(1.0 * (2**attempt) + random.uniform(0, 1), 30.0)
                 logger.warning(f"Kalshi 429 on {path}, retrying in {delay:.1f}s (attempt {attempt + 1})")
                 await asyncio.sleep(delay)
                 continue
             resp.raise_for_status()
             return resp.json()
-        resp.raise_for_status()  # raise on final failure
+        resp.raise_for_status()  # raise on final failure — caller handles this
         return {}
 
     @log_api_call(logger)
@@ -70,7 +70,11 @@ class KalshiCollector:
             if cursor:
                 params["cursor"] = cursor
 
-            data = await self._fetch_page(client, "/markets", params)
+            try:
+                data = await self._fetch_page(client, "/markets", params)
+            except Exception as e:
+                logger.warning(f"Kalshi page fetch failed, returning {len(markets):,} partial markets: {e}")
+                break
 
             for raw in data.get("markets", []):
                 normalized = self._normalize(raw)
