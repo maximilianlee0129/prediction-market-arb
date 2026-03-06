@@ -19,7 +19,7 @@ from backend.utils.logger import get_logger, log_api_call
 logger = get_logger(__name__)
 
 # Delay between pages to stay under rate limits
-PAGE_DELAY = 0.15  # seconds
+PAGE_DELAY = 0.3  # seconds — halves request rate vs 0.15, avoids sustained 429s
 
 
 class KalshiCollector:
@@ -40,10 +40,10 @@ class KalshiCollector:
 
     async def _fetch_page(self, client: httpx.AsyncClient, path: str, params: dict) -> dict:
         """Fetch a single page with per-request retry on 429."""
-        for attempt in range(5):
+        for attempt in range(8):
             resp = await client.get(path, params=params)
             if resp.status_code == 429:
-                delay = min(1.0 * (2**attempt) + random.uniform(0, 1), 30.0)
+                delay = min(1.0 * (2**attempt) + random.uniform(0, 1), 120.0)
                 logger.warning(f"Kalshi 429 on {path}, retrying in {delay:.1f}s (attempt {attempt + 1})")
                 await asyncio.sleep(delay)
                 continue
