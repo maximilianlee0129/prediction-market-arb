@@ -26,8 +26,8 @@ MAX_ANNUALIZED_PCT = 10_000.0
 # Max allowed probability divergence between platforms.
 # If Kalshi says YES=0.40 and Polymarket says YES=0.85 (inferred from NO=0.15),
 # that's a 0.45 divergence — almost certainly a bad match, not a real arb.
-# Real arbs come from small discrepancies (~2–15%) on the same market.
-MAX_PRICE_DIVERGENCE = 0.25
+# Real arbs come from small discrepancies (~2–10%) on the same market.
+MAX_PRICE_DIVERGENCE = 0.12
 
 # Composite score weights
 # Confidence is a gate (all accepted pairs already passed threshold), not a ranking signal.

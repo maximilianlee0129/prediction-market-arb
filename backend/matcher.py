@@ -117,6 +117,8 @@ def _build_claude_prompt(pairs: list[MatchCandidate]) -> str:
 
 Two markets "match" if they resolve identically — a YES on one platform means YES on the other, and vice versa. Be strict: similar topics are NOT matches unless they ask the exact same question with the same resolution criteria.
 
+CRITICAL: If the two markets are different specific outcomes of the same broader event — e.g. "Will [Person A] be James Bond?" vs "Will [Person B] be James Bond?", or "Will [Team A] win the championship?" vs "Will [Team B] win the championship?" — they do NOT match. Only match if both markets refer to the EXACT SAME specific outcome.
+
 For each pair below, respond with a JSON object containing:
 - "pair": the pair number (integer)
 - "match": true or false
