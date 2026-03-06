@@ -30,10 +30,12 @@ MAX_ANNUALIZED_PCT = 10_000.0
 MAX_PRICE_DIVERGENCE = 0.25
 
 # Composite score weights
-W_PROFIT = 0.50
+# Confidence is a gate (all accepted pairs already passed threshold), not a ranking signal.
+# Liquidity is a display metric — don't let it distort opportunity ranking.
+W_PROFIT = 0.65
 W_ANNUALIZED = 0.35
-W_CONFIDENCE = 0.10
-W_LIQUIDITY = 0.05
+W_CONFIDENCE = 0.0
+W_LIQUIDITY = 0.0
 
 # Normalization caps for composite score (values above these get score=1.0)
 PROFIT_CAP = 20.0       # 20% net profit → max score

@@ -227,29 +227,58 @@ async def claude_batch_match(
 async def run_matching(
     kalshi_markets: list[dict],
     poly_markets: list[dict],
-) -> list[MatchCandidate]:
+    rejected_pairs: set[tuple[str, str]] | None = None,
+) -> tuple[list[MatchCandidate], list[MatchCandidate]]:
     """
     Full matching pipeline:
     1. Fuzzy prefilter → candidate pairs
-    2. Claude batch verification → confirmed matches
+    2. Skip already-rejected pairs (previously evaluated by Claude)
+    3. Claude batch verification → confirmed matches
 
-    Returns confirmed MatchCandidate objects with confidence and reasoning.
+    Returns (confirmed, newly_rejected):
+    - confirmed: MatchCandidate objects accepted as real matches
+    - newly_rejected: MatchCandidate objects Claude evaluated and rejected this run
     """
     if not kalshi_markets or not poly_markets:
-        return []
+        return [], []
 
     # Step 1: Fast fuzzy prefilter
     candidates = fuzzy_prefilter(kalshi_markets, poly_markets)
     if not candidates:
         logger.info("No fuzzy candidates found")
-        return []
+        return [], []
+
+    # Step 2: Skip pairs already evaluated and rejected in a prior cycle
+    if rejected_pairs:
+        before = len(candidates)
+        candidates = [
+            c for c in candidates
+            if (c.kalshi_market["platform_id"], c.poly_market["platform_id"]) not in rejected_pairs
+        ]
+        skipped = before - len(candidates)
+        if skipped:
+            logger.info(f"Skipped {skipped} previously-rejected pairs — {len(candidates)} remain")
+
+    if not candidates:
+        logger.info("All candidates were previously rejected — nothing new to evaluate")
+        return [], []
 
     logger.info(f"Sending {len(candidates)} candidates to Claude for verification")
 
-    # Step 2: Claude verification
+    # Step 3: Claude verification
     confirmed = await claude_batch_match(candidates)
 
-    # Deduplicate: keep highest confidence match per Kalshi market
+    # Determine which candidates Claude rejected this run
+    confirmed_keys = {
+        (c.kalshi_market["platform_id"], c.poly_market["platform_id"])
+        for c in confirmed
+    }
+    newly_rejected = [
+        c for c in candidates
+        if (c.kalshi_market["platform_id"], c.poly_market["platform_id"]) not in confirmed_keys
+    ]
+
+    # Deduplicate confirmed: keep highest confidence match per Kalshi market
     best_by_kalshi: dict[str, MatchCandidate] = {}
     for c in confirmed:
         k_id = c.kalshi_market["platform_id"]
@@ -266,6 +295,6 @@ async def run_matching(
     final = list(best_by_poly.values())
     final.sort(key=lambda c: c.confidence, reverse=True)
 
-    logger.info(f"Matching complete: {len(final)} confirmed pairs "
+    logger.info(f"Matching complete: {len(final)} confirmed, {len(newly_rejected)} rejected "
                 f"(from {len(candidates)} candidates)")
-    return final
+    return final, newly_rejected

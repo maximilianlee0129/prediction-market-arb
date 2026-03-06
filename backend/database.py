@@ -31,6 +31,6 @@ async def get_db() -> AsyncSession:
 
 
 async def init_db() -> None:
-    from backend.models import market, matched_pair, opportunity  # noqa: F401 — registers models with Base
+    from backend.models import market, matched_pair, opportunity, rejected_pair  # noqa: F401 — registers models with Base
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)

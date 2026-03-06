@@ -23,6 +23,7 @@ from backend.config import settings
 from backend.database import init_db, AsyncSessionLocal
 from backend.models.market import Market, PriceSnapshot
 from backend.models.matched_pair import MatchedPair
+from backend.models.rejected_pair import RejectedPair
 from backend.models.opportunity import ArbitrageOpportunity, OpportunityLog
 from backend.collectors.kalshi import KalshiCollector
 from backend.collectors.polymarket import PolymarketCollector
@@ -157,6 +158,16 @@ async def run_market_matching(
         )
         id_lookup = {(r.platform, r.platform_id): r.id for r in result.all()}
 
+        # Load all previously rejected pairs so Claude doesn't re-evaluate them
+        rejected_result = await session.execute(
+            select(RejectedPair.kalshi_platform_id, RejectedPair.poly_platform_id)
+        )
+        rejected_pairs: set[tuple[str, str]] = {
+            (r.kalshi_platform_id, r.poly_platform_id) for r in rejected_result.all()
+        }
+
+    logger.info(f"Loaded {len(rejected_pairs)} previously-rejected pairs from DB")
+
     # Filter out already-matched markets
     unmatched_kalshi = [
         m for m in kalshi_markets
@@ -174,9 +185,9 @@ async def run_market_matching(
     logger.info(f"Running matcher on {len(unmatched_kalshi)} Kalshi + "
                 f"{len(unmatched_poly)} Polymarket unmatched markets")
 
-    matches = await run_matching(unmatched_kalshi, unmatched_poly)
+    matches, newly_rejected = await run_matching(unmatched_kalshi, unmatched_poly, rejected_pairs)
 
-    # Persist new matched pairs
+    # Persist new matched pairs and newly rejected pairs
     new_pairs = 0
     async with AsyncSessionLocal() as session:
         for match in matches:
@@ -195,6 +206,22 @@ async def run_market_matching(
             )
             session.add(pair)
             new_pairs += 1
+
+        # Save newly rejected pairs — INSERT OR IGNORE so duplicates don't crash
+        if newly_rejected:
+            from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+            rejected_values = [
+                {
+                    "kalshi_platform_id": c.kalshi_market["platform_id"],
+                    "poly_platform_id": c.poly_market["platform_id"],
+                    "fuzzy_score": c.fuzzy_score,
+                }
+                for c in newly_rejected
+            ]
+            stmt = sqlite_insert(RejectedPair).values(rejected_values)
+            stmt = stmt.on_conflict_do_nothing(index_elements=["kalshi_platform_id", "poly_platform_id"])
+            await session.execute(stmt)
+            logger.info(f"Saved {len(newly_rejected)} newly rejected pairs to DB")
 
         await session.commit()
 
