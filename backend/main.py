@@ -354,6 +354,7 @@ async def detect_arbs() -> list[dict]:
 
         await session.commit()
 
+    new_opps.sort(key=lambda o: o.get("composite_score", 0), reverse=True)
     return new_opps
 
 
