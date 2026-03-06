@@ -403,8 +403,33 @@ async def poll_loop() -> None:
                 k_markets = await _fetch_and_upsert(kalshi, "Kalshi")
                 p_markets = await _fetch_and_upsert(polymarket, "Polymarket")
 
+                # If a fresh fetch returned too few markets (early 429 failure), fall back to DB
+                MIN_FRESH_MARKETS = 500
+                if len(k_markets) < MIN_FRESH_MARKETS:
+                    logger.warning(
+                        f"Kalshi fresh fetch returned only {len(k_markets)} markets "
+                        f"(< {MIN_FRESH_MARKETS}), loading from DB for matching"
+                    )
+                    async with AsyncSessionLocal() as session:
+                        from backend.matcher import MIN_VOLUME_FOR_MATCHING
+                        db_result = await session.execute(
+                            select(Market.platform_id, Market.title, Market.category, Market.volume)
+                            .where(
+                                Market.platform == "kalshi",
+                                Market.status.in_(["open", "active"]),
+                                Market.volume >= MIN_VOLUME_FOR_MATCHING,
+                            )
+                        )
+                        k_markets = [
+                            {"platform_id": r.platform_id, "title": r.title,
+                             "category": r.category or "", "volume": r.volume or 0}
+                            for r in db_result.all()
+                        ]
+                    logger.info(f"Loaded {len(k_markets)} Kalshi markets from DB for matching")
+
                 if k_markets and p_markets:
-                    _print_top_markets("KALSHI", k_markets)
+                    if len(k_markets) >= MIN_FRESH_MARKETS:
+                        _print_top_markets("KALSHI", k_markets)
                     _print_top_markets("POLYMARKET", p_markets)
 
                     k_slim = [{"platform_id": m["platform_id"], "title": m["title"],
