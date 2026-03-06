@@ -124,6 +124,13 @@ class KalshiCollector:
         Kalshi v2 returns prices as dollar strings: "0.6500"
         Already 0-1 scale — no division needed.
         """
+        # Skip multi-leg combo/parlay markets (KXMVE prefix).
+        # These are cross-category and multi-game parlays with no Polymarket equivalent.
+        # They make up 70%+ of Kalshi's market count but can never produce arb opportunities.
+        ticker = raw.get("ticker", "")
+        if ticker.startswith("KXMVE"):
+            return None
+
         # Parse dollar-string prices, defaulting to 0 if missing/empty
         def _price(field: str) -> float:
             val = raw.get(field, "")
