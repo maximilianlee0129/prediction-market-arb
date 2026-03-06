@@ -41,6 +41,9 @@ logger = get_logger(__name__)
 kalshi = KalshiCollector()
 polymarket = PolymarketCollector()
 
+# In-memory cache of last successful Kalshi slim market list for matching fallback
+_kalshi_slim_cache: list[dict] = []
+
 
 # ── Market upsert (unchanged from Phase 1) ──────────────────────────────────
 
@@ -403,32 +406,42 @@ async def poll_loop() -> None:
                 k_markets = await _fetch_and_upsert(kalshi, "Kalshi")
                 p_markets = await _fetch_and_upsert(polymarket, "Polymarket")
 
-                # If a fresh fetch returned too few markets (early 429 failure), fall back to DB
                 MIN_FRESH_MARKETS = 500
-                if len(k_markets) < MIN_FRESH_MARKETS:
-                    logger.warning(
-                        f"Kalshi fresh fetch returned only {len(k_markets)} markets "
-                        f"(< {MIN_FRESH_MARKETS}), loading from DB for matching"
-                    )
-                    async with AsyncSessionLocal() as session:
-                        from backend.matcher import MIN_VOLUME_FOR_MATCHING
-                        db_result = await session.execute(
-                            select(Market.platform_id, Market.title, Market.category, Market.volume)
-                            .where(
-                                Market.platform == "kalshi",
-                                Market.status.in_(["open", "active"]),
-                                Market.volume >= MIN_VOLUME_FOR_MATCHING,
-                            )
+                is_fresh_kalshi = len(k_markets) >= MIN_FRESH_MARKETS
+
+                if not is_fresh_kalshi:
+                    # Primary fallback: in-memory cache from last successful collection
+                    if _kalshi_slim_cache:
+                        logger.warning(
+                            f"Kalshi fresh fetch returned only {len(k_markets)} markets, "
+                            f"using memory cache ({len(_kalshi_slim_cache)} markets)"
                         )
-                        k_markets = [
-                            {"platform_id": r.platform_id, "title": r.title,
-                             "category": r.category or "", "volume": r.volume or 0}
-                            for r in db_result.all()
-                        ]
-                    logger.info(f"Loaded {len(k_markets)} Kalshi markets from DB for matching")
+                        k_markets = _kalshi_slim_cache
+                    else:
+                        # Secondary fallback: DB (sparse on startup until first success)
+                        logger.warning(
+                            f"Kalshi fresh fetch returned only {len(k_markets)} markets "
+                            f"and cache empty, loading from DB"
+                        )
+                        async with AsyncSessionLocal() as session:
+                            from backend.matcher import MIN_VOLUME_FOR_MATCHING
+                            db_result = await session.execute(
+                                select(Market.platform_id, Market.title, Market.category, Market.volume)
+                                .where(
+                                    Market.platform == "kalshi",
+                                    Market.status.in_(["open", "active"]),
+                                    Market.volume >= MIN_VOLUME_FOR_MATCHING,
+                                )
+                            )
+                            k_markets = [
+                                {"platform_id": r.platform_id, "title": r.title,
+                                 "category": r.category or "", "volume": r.volume or 0}
+                                for r in db_result.all()
+                            ]
+                        logger.info(f"Loaded {len(k_markets)} Kalshi markets from DB for matching")
 
                 if k_markets and p_markets:
-                    if len(k_markets) >= MIN_FRESH_MARKETS:
+                    if is_fresh_kalshi:
                         _print_top_markets("KALSHI", k_markets)
                     _print_top_markets("POLYMARKET", p_markets)
 
@@ -438,6 +451,12 @@ async def poll_loop() -> None:
                     p_slim = [{"platform_id": m["platform_id"], "title": m["title"],
                                "category": m.get("category", ""), "volume": m.get("volume", 0)}
                               for m in p_markets]
+
+                    # Update in-memory cache after a fresh successful collection
+                    if is_fresh_kalshi:
+                        global _kalshi_slim_cache
+                        _kalshi_slim_cache = k_slim
+                        logger.info(f"Kalshi market cache updated: {len(_kalshi_slim_cache)} markets")
 
                     del k_markets, p_markets
                     gc.collect()
