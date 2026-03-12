@@ -236,6 +236,8 @@ async def run_market_matching(
 
 async def detect_arbs() -> list[dict]:
     """Scan all active matched pairs for arb opportunities. Returns new/updated opps."""
+    ACTIVE_STATUSES = {"open", "active"}
+
     async with AsyncSessionLocal() as session:
         pairs = (
             await session.execute(
@@ -273,6 +275,29 @@ async def detect_arbs() -> list[dict]:
             km = market_map.get(pair.kalshi_market_id)
             pm = market_map.get(pair.poly_market_id)
             if not km or not pm:
+                continue
+
+            # Skip resolved/closed markets — expire any existing opp
+            if (km.status or "").lower() not in ACTIVE_STATUSES or (pm.status or "").lower() not in ACTIVE_STATUSES:
+                existing_opp = opp_by_pair.get(pair.id)
+                if existing_opp:
+                    await session.execute(
+                        update(ArbitrageOpportunity)
+                        .where(ArbitrageOpportunity.id == existing_opp.id)
+                        .values(is_active=False, expired_at=datetime.utcnow())
+                    )
+                    session.add(OpportunityLog(
+                        opportunity_id=existing_opp.id,
+                        event_type="closed",
+                        net_profit_pct=0.0,
+                    ))
+                    logger.info(f"Expired opp {existing_opp.id}: market resolved (kalshi={km.status}, poly={pm.status})")
+                # Also deactivate the matched pair since the market is done
+                await session.execute(
+                    update(MatchedPair)
+                    .where(MatchedPair.id == pair.id)
+                    .values(is_active=False)
+                )
                 continue
 
             # Convert ORM objects to dicts for arb engine

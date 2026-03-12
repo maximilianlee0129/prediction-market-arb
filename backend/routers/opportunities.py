@@ -36,6 +36,9 @@ async def list_opportunities(
 
         if active_only:
             stmt = stmt.where(ArbitrageOpportunity.is_active == True)
+            # Exclude opportunities where either market has resolved/closed
+            stmt = stmt.where(KalshiMarket.c.status.in_(["open", "active"]))
+            stmt = stmt.where(PolyMarket.c.status.in_(["open", "active"]))
         if min_profit > 0:
             stmt = stmt.where(ArbitrageOpportunity.net_profit_pct >= min_profit)
 
