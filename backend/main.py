@@ -44,10 +44,6 @@ polymarket = PolymarketCollector()
 # In-memory cache of last successful Kalshi slim market list for matching fallback
 _kalshi_slim_cache: list[dict] = []
 
-# Track last successful full refresh per platform (UTC datetime).
-# Used to gate staleness expiration — we only expire stale markets when we know
-# the collector is working (otherwise a collector outage would nuke all arbs).
-_last_successful_refresh: dict[str, datetime] = {}
 
 
 # ── Market upsert (unchanged from Phase 1) ──────────────────────────────────
@@ -242,23 +238,6 @@ async def run_market_matching(
 async def detect_arbs() -> list[dict]:
     """Scan all active matched pairs for arb opportunities. Returns new/updated opps."""
     ACTIVE_STATUSES = {"open", "active"}
-    # Markets not refreshed in this many seconds are considered stale/resolved.
-    # Collectors only fetch open markets, so resolved ones simply stop appearing
-    # in API results and their last_updated stops advancing.
-    STALE_THRESHOLD_SECONDS = 15 * 60  # 15 min = 3x the 5-min full refresh cycle
-    # Only apply staleness if the collector itself succeeded recently.
-    # This prevents a collector outage from expiring all valid arbs.
-    COLLECTOR_HEALTHY_SECONDS = 20 * 60  # 20 min — 4x refresh cycle
-
-    now = datetime.utcnow()
-    kalshi_collector_healthy = (
-        "kalshi" in _last_successful_refresh
-        and (now - _last_successful_refresh["kalshi"]).total_seconds() < COLLECTOR_HEALTHY_SECONDS
-    )
-    poly_collector_healthy = (
-        "polymarket" in _last_successful_refresh
-        and (now - _last_successful_refresh["polymarket"]).total_seconds() < COLLECTOR_HEALTHY_SECONDS
-    )
 
     async with AsyncSessionLocal() as session:
         pairs = (
@@ -299,25 +278,13 @@ async def detect_arbs() -> list[dict]:
             if not km or not pm:
                 continue
 
-            # Check if either market is stale (no longer returned by API).
-            # Only apply staleness per-platform when that platform's collector
-            # is healthy — otherwise a collector outage would expire all arbs.
-            now_inner = datetime.utcnow()
-            km_stale = (
-                kalshi_collector_healthy
-                and km.last_updated
-                and (now_inner - km.last_updated).total_seconds() > STALE_THRESHOLD_SECONDS
-            )
-            pm_stale = (
-                poly_collector_healthy
-                and pm.last_updated
-                and (now_inner - pm.last_updated).total_seconds() > STALE_THRESHOLD_SECONDS
-            )
-            km_inactive = (km.status or "").lower() not in ACTIVE_STATUSES
-            pm_inactive = (pm.status or "").lower() not in ACTIVE_STATUSES
-
-            # Skip resolved/closed/stale markets — expire any existing opp
-            if km_inactive or pm_inactive or km_stale or pm_stale:
+            # Skip resolved/closed markets — expire any existing opp.
+            # Market status is kept up-to-date by _fetch_and_upsert: after a
+            # successful fresh fetch, markets NOT in the API results are marked
+            # status='closed'.
+            km_status = (km.status or "").lower()
+            pm_status = (pm.status or "").lower()
+            if km_status not in ACTIVE_STATUSES or pm_status not in ACTIVE_STATUSES:
                 existing_opp = opp_by_pair.get(pair.id)
                 if existing_opp:
                     await session.execute(
@@ -330,16 +297,7 @@ async def detect_arbs() -> list[dict]:
                         event_type="closed",
                         net_profit_pct=0.0,
                     ))
-                    reason = []
-                    if km_inactive:
-                        reason.append(f"kalshi_status={km.status}")
-                    if pm_inactive:
-                        reason.append(f"poly_status={pm.status}")
-                    if km_stale:
-                        reason.append(f"kalshi_stale={km.last_updated}")
-                    if pm_stale:
-                        reason.append(f"poly_stale={pm.last_updated}")
-                    logger.info(f"Expired opp {existing_opp.id}: {', '.join(reason)}")
+                    logger.info(f"Expired opp {existing_opp.id}: kalshi={km_status}, poly={pm_status}")
                 # Also deactivate the matched pair since the market is done
                 await session.execute(
                     update(MatchedPair)
@@ -436,26 +394,61 @@ async def detect_arbs() -> list[dict]:
 
 # ── Polling loop (upgraded from Phase 1) ─────────────────────────────────────
 
-async def _fetch_and_upsert(collector, platform: str) -> list[dict]:
-    """Fetch markets from one platform, upsert to DB, return the list.
+async def _fetch_and_upsert(collector, platform: str) -> tuple[list[dict], bool]:
+    """Fetch markets from one platform, upsert to DB, return (list, is_fresh).
 
     Only stores markets with volume >= MIN_VOLUME_FOR_MATCHING. Zero-volume
     markets (e.g. Kalshi multi-leg combo bets with no activity) are never
     candidates for matching and waste significant disk space.
+
+    After a successful fresh fetch (>= MIN_FRESH_MARKETS), marks all DB markets
+    for this platform that were NOT in the fresh set as status='closed'. This is
+    how we detect resolved markets — they simply stop appearing in API results.
     """
+    MIN_FRESH_MARKETS = 500
     from backend.matcher import MIN_VOLUME_FOR_MATCHING
     try:
         markets = await collector.fetch_all_markets()
     except Exception as e:
         logger.error(f"{platform} fetch failed: {e}")
-        return []
-    if markets:
-        before = len(markets)
-        markets = [m for m in markets if (m.get("volume") or 0) >= MIN_VOLUME_FOR_MATCHING]
-        logger.info(f"{platform}: filtered {before} → {len(markets)} markets (volume >= {MIN_VOLUME_FOR_MATCHING})")
-        total = await upsert_markets(markets)
-        logger.info(f"{platform}: {total} markets upserted")
-    return markets
+        return [], False
+    if not markets:
+        return [], False
+
+    before = len(markets)
+    markets = [m for m in markets if (m.get("volume") or 0) >= MIN_VOLUME_FOR_MATCHING]
+    logger.info(f"{platform}: filtered {before} → {len(markets)} markets (volume >= {MIN_VOLUME_FOR_MATCHING})")
+    total = await upsert_markets(markets)
+    logger.info(f"{platform}: {total} markets upserted")
+
+    is_fresh = len(markets) >= MIN_FRESH_MARKETS
+
+    # After a full successful fetch, mark markets no longer in the API as closed
+    if is_fresh:
+        fresh_platform_ids = {m["platform_id"] for m in markets}
+        platform_name = "kalshi" if "kalshi" in platform.lower() else "polymarket"
+        async with AsyncSessionLocal() as session:
+            # Find all open/active markets for this platform NOT in fresh set
+            stale_result = await session.execute(
+                select(Market.id, Market.platform_id)
+                .where(
+                    Market.platform == platform_name,
+                    Market.status.in_(["open", "active"]),
+                    Market.platform_id.notin_(fresh_platform_ids),
+                )
+            )
+            stale_markets = stale_result.all()
+            if stale_markets:
+                stale_ids = [m.id for m in stale_markets]
+                await session.execute(
+                    update(Market)
+                    .where(Market.id.in_(stale_ids))
+                    .values(status="closed")
+                )
+                await session.commit()
+                logger.info(f"{platform}: marked {len(stale_ids)} markets as closed (no longer in API)")
+
+    return markets, is_fresh
 
 
 async def poll_loop() -> None:
@@ -477,18 +470,8 @@ async def poll_loop() -> None:
             if is_full_refresh:
                 # Full refresh: fetch all markets, upsert, match new pairs
                 logger.info("Full market refresh + matching...")
-                k_markets = await _fetch_and_upsert(kalshi, "Kalshi")
-                p_markets = await _fetch_and_upsert(polymarket, "Polymarket")
-
-                MIN_FRESH_MARKETS = 500
-                is_fresh_kalshi = len(k_markets) >= MIN_FRESH_MARKETS
-                is_fresh_poly = len(p_markets) >= MIN_FRESH_MARKETS
-
-                # Record successful refreshes for staleness gating
-                if is_fresh_kalshi:
-                    _last_successful_refresh["kalshi"] = datetime.utcnow()
-                if is_fresh_poly:
-                    _last_successful_refresh["polymarket"] = datetime.utcnow()
+                k_markets, is_fresh_kalshi = await _fetch_and_upsert(kalshi, "Kalshi")
+                p_markets, is_fresh_poly = await _fetch_and_upsert(polymarket, "Polymarket")
 
                 if not is_fresh_kalshi:
                     # Primary fallback: in-memory cache from last successful collection
@@ -613,54 +596,36 @@ def _print_opportunities(opps: list[dict], n: int = 10) -> None:
 
 # ── FastAPI app ──────────────────────────────────────────────────────────────
 
-async def _reactivate_wrongly_expired() -> None:
-    """One-time startup recovery: reactivate matched pairs and opportunities
-    that were wrongly deactivated by the staleness bug (collector outage
-    caused all markets to appear stale, nuking all arbs).
+async def _startup_cleanup() -> None:
+    """Startup cleanup: reset all opportunities and reactivate all matched pairs.
 
-    Reactivates pairs where BOTH underlying markets still have open/active status.
+    This ensures a clean slate — detect_arbs() will re-evaluate every active
+    matched pair on the first cycle and only create opportunities for markets
+    that are genuinely still open with real spreads.
     """
     async with AsyncSessionLocal() as session:
-        KM = Market.__table__.alias("km")
-        PM = Market.__table__.alias("pm")
+        # Deactivate all opportunities — detect_arbs will recreate valid ones
+        result = await session.execute(
+            update(ArbitrageOpportunity)
+            .where(ArbitrageOpportunity.is_active == True)
+            .values(is_active=False, expired_at=datetime.utcnow())
+        )
+        cleared_opps = result.rowcount
 
-        # Find inactive matched pairs where both markets are still open
-        inactive_pairs = (
-            await session.execute(
-                select(MatchedPair.id)
-                .join(KM, MatchedPair.kalshi_market_id == KM.c.id)
-                .join(PM, MatchedPair.poly_market_id == PM.c.id)
-                .where(
-                    MatchedPair.is_active == False,
-                    KM.c.status.in_(["open", "active"]),
-                    PM.c.status.in_(["open", "active"]),
-                )
-            )
-        ).scalars().all()
-
-        if not inactive_pairs:
-            logger.info("Startup recovery: no wrongly-deactivated pairs found")
-            return
-
-        # Reactivate matched pairs
-        await session.execute(
+        # Reactivate all matched pairs — detect_arbs will deactivate ones
+        # with closed markets after the first successful fetch marks them
+        result2 = await session.execute(
             update(MatchedPair)
-            .where(MatchedPair.id.in_(inactive_pairs))
+            .where(MatchedPair.is_active == False)
             .values(is_active=True)
         )
-
-        # Reactivate their opportunities (clear expired_at)
-        await session.execute(
-            update(ArbitrageOpportunity)
-            .where(
-                ArbitrageOpportunity.matched_pair_id.in_(inactive_pairs),
-                ArbitrageOpportunity.is_active == False,
-            )
-            .values(is_active=True, expired_at=None)
-        )
+        reactivated_pairs = result2.rowcount
 
         await session.commit()
-        logger.info(f"Startup recovery: reactivated {len(inactive_pairs)} matched pairs")
+        logger.info(
+            f"Startup cleanup: cleared {cleared_opps} opps, "
+            f"reactivated {reactivated_pairs} matched pairs"
+        )
 
 
 @asynccontextmanager
@@ -668,7 +633,7 @@ async def lifespan(app: FastAPI):
     await init_db()
     logger.info("Database initialized")
 
-    await _reactivate_wrongly_expired()
+    await _startup_cleanup()
 
     poll_task = asyncio.create_task(poll_loop())
     logger.info(
