@@ -613,10 +613,62 @@ def _print_opportunities(opps: list[dict], n: int = 10) -> None:
 
 # ── FastAPI app ──────────────────────────────────────────────────────────────
 
+async def _reactivate_wrongly_expired() -> None:
+    """One-time startup recovery: reactivate matched pairs and opportunities
+    that were wrongly deactivated by the staleness bug (collector outage
+    caused all markets to appear stale, nuking all arbs).
+
+    Reactivates pairs where BOTH underlying markets still have open/active status.
+    """
+    async with AsyncSessionLocal() as session:
+        KM = Market.__table__.alias("km")
+        PM = Market.__table__.alias("pm")
+
+        # Find inactive matched pairs where both markets are still open
+        inactive_pairs = (
+            await session.execute(
+                select(MatchedPair.id)
+                .join(KM, MatchedPair.kalshi_market_id == KM.c.id)
+                .join(PM, MatchedPair.poly_market_id == PM.c.id)
+                .where(
+                    MatchedPair.is_active == False,
+                    KM.c.status.in_(["open", "active"]),
+                    PM.c.status.in_(["open", "active"]),
+                )
+            )
+        ).scalars().all()
+
+        if not inactive_pairs:
+            logger.info("Startup recovery: no wrongly-deactivated pairs found")
+            return
+
+        # Reactivate matched pairs
+        await session.execute(
+            update(MatchedPair)
+            .where(MatchedPair.id.in_(inactive_pairs))
+            .values(is_active=True)
+        )
+
+        # Reactivate their opportunities (clear expired_at)
+        await session.execute(
+            update(ArbitrageOpportunity)
+            .where(
+                ArbitrageOpportunity.matched_pair_id.in_(inactive_pairs),
+                ArbitrageOpportunity.is_active == False,
+            )
+            .values(is_active=True, expired_at=None)
+        )
+
+        await session.commit()
+        logger.info(f"Startup recovery: reactivated {len(inactive_pairs)} matched pairs")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await init_db()
     logger.info("Database initialized")
+
+    await _reactivate_wrongly_expired()
 
     poll_task = asyncio.create_task(poll_loop())
     logger.info(
