@@ -282,9 +282,14 @@ async def detect_arbs() -> list[dict]:
             # Market status is kept up-to-date by _fetch_and_upsert: after a
             # successful fresh fetch, markets NOT in the API results are marked
             # status='closed'.
+            # Also skip markets whose close_time has passed — the event is over
+            # even if the platform hasn't officially settled yet.
+            now = datetime.utcnow()
             km_status = (km.status or "").lower()
             pm_status = (pm.status or "").lower()
-            if km_status not in ACTIVE_STATUSES or pm_status not in ACTIVE_STATUSES:
+            km_expired = km.close_time and km.close_time.replace(tzinfo=None) < now
+            pm_expired = pm.close_time and pm.close_time.replace(tzinfo=None) < now
+            if km_status not in ACTIVE_STATUSES or pm_status not in ACTIVE_STATUSES or km_expired or pm_expired:
                 existing_opp = opp_by_pair.get(pair.id)
                 if existing_opp:
                     await session.execute(
@@ -297,7 +302,12 @@ async def detect_arbs() -> list[dict]:
                         event_type="closed",
                         net_profit_pct=0.0,
                     ))
-                    logger.info(f"Expired opp {existing_opp.id}: kalshi={km_status}, poly={pm_status}")
+                    reasons = f"kalshi={km_status}, poly={pm_status}"
+                    if km_expired:
+                        reasons += f", kalshi_closed={km.close_time}"
+                    if pm_expired:
+                        reasons += f", poly_closed={pm.close_time}"
+                    logger.info(f"Expired opp {existing_opp.id}: {reasons}")
                 # Also deactivate the matched pair since the market is done
                 await session.execute(
                     update(MatchedPair)

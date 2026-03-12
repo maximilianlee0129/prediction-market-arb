@@ -1,6 +1,8 @@
 """Opportunities API router — browse and query arb opportunities."""
+from datetime import datetime
+
 from fastapi import APIRouter, Query
-from sqlalchemy import select
+from sqlalchemy import select, or_
 
 from backend.database import AsyncSessionLocal
 from backend.models.opportunity import ArbitrageOpportunity, OpportunityLog
@@ -35,10 +37,14 @@ async def list_opportunities(
         )
 
         if active_only:
+            now = datetime.utcnow()
             stmt = stmt.where(ArbitrageOpportunity.is_active == True)
             # Exclude opportunities where either market has resolved/closed
             stmt = stmt.where(KalshiMarket.c.status.in_(["open", "active"]))
             stmt = stmt.where(PolyMarket.c.status.in_(["open", "active"]))
+            # Exclude markets whose close_time has passed (event over, pending settlement)
+            stmt = stmt.where(or_(KalshiMarket.c.close_time.is_(None), KalshiMarket.c.close_time >= now))
+            stmt = stmt.where(or_(PolyMarket.c.close_time.is_(None), PolyMarket.c.close_time >= now))
         if min_profit > 0:
             stmt = stmt.where(ArbitrageOpportunity.net_profit_pct >= min_profit)
 
