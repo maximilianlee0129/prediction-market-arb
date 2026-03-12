@@ -606,44 +606,10 @@ def _print_opportunities(opps: list[dict], n: int = 10) -> None:
 
 # ── FastAPI app ──────────────────────────────────────────────────────────────
 
-async def _startup_cleanup() -> None:
-    """Startup cleanup: reset all opportunities and reactivate all matched pairs.
-
-    This ensures a clean slate — detect_arbs() will re-evaluate every active
-    matched pair on the first cycle and only create opportunities for markets
-    that are genuinely still open with real spreads.
-    """
-    async with AsyncSessionLocal() as session:
-        # Deactivate all opportunities — detect_arbs will recreate valid ones
-        result = await session.execute(
-            update(ArbitrageOpportunity)
-            .where(ArbitrageOpportunity.is_active == True)
-            .values(is_active=False, expired_at=datetime.utcnow())
-        )
-        cleared_opps = result.rowcount
-
-        # Reactivate all matched pairs — detect_arbs will deactivate ones
-        # with closed markets after the first successful fetch marks them
-        result2 = await session.execute(
-            update(MatchedPair)
-            .where(MatchedPair.is_active == False)
-            .values(is_active=True)
-        )
-        reactivated_pairs = result2.rowcount
-
-        await session.commit()
-        logger.info(
-            f"Startup cleanup: cleared {cleared_opps} opps, "
-            f"reactivated {reactivated_pairs} matched pairs"
-        )
-
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await init_db()
     logger.info("Database initialized")
-
-    await _startup_cleanup()
 
     poll_task = asyncio.create_task(poll_loop())
     logger.info(
