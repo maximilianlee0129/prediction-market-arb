@@ -44,6 +44,11 @@ polymarket = PolymarketCollector()
 # In-memory cache of last successful Kalshi slim market list for matching fallback
 _kalshi_slim_cache: list[dict] = []
 
+# Track last successful full refresh per platform (UTC datetime).
+# Used to gate staleness expiration — we only expire stale markets when we know
+# the collector is working (otherwise a collector outage would nuke all arbs).
+_last_successful_refresh: dict[str, datetime] = {}
+
 
 # ── Market upsert (unchanged from Phase 1) ──────────────────────────────────
 
@@ -241,6 +246,19 @@ async def detect_arbs() -> list[dict]:
     # Collectors only fetch open markets, so resolved ones simply stop appearing
     # in API results and their last_updated stops advancing.
     STALE_THRESHOLD_SECONDS = 15 * 60  # 15 min = 3x the 5-min full refresh cycle
+    # Only apply staleness if the collector itself succeeded recently.
+    # This prevents a collector outage from expiring all valid arbs.
+    COLLECTOR_HEALTHY_SECONDS = 20 * 60  # 20 min — 4x refresh cycle
+
+    now = datetime.utcnow()
+    kalshi_collector_healthy = (
+        "kalshi" in _last_successful_refresh
+        and (now - _last_successful_refresh["kalshi"]).total_seconds() < COLLECTOR_HEALTHY_SECONDS
+    )
+    poly_collector_healthy = (
+        "polymarket" in _last_successful_refresh
+        and (now - _last_successful_refresh["polymarket"]).total_seconds() < COLLECTOR_HEALTHY_SECONDS
+    )
 
     async with AsyncSessionLocal() as session:
         pairs = (
@@ -281,10 +299,20 @@ async def detect_arbs() -> list[dict]:
             if not km or not pm:
                 continue
 
-            # Check if either market is stale (no longer returned by API)
-            now = datetime.utcnow()
-            km_stale = km.last_updated and (now - km.last_updated).total_seconds() > STALE_THRESHOLD_SECONDS
-            pm_stale = pm.last_updated and (now - pm.last_updated).total_seconds() > STALE_THRESHOLD_SECONDS
+            # Check if either market is stale (no longer returned by API).
+            # Only apply staleness per-platform when that platform's collector
+            # is healthy — otherwise a collector outage would expire all arbs.
+            now_inner = datetime.utcnow()
+            km_stale = (
+                kalshi_collector_healthy
+                and km.last_updated
+                and (now_inner - km.last_updated).total_seconds() > STALE_THRESHOLD_SECONDS
+            )
+            pm_stale = (
+                poly_collector_healthy
+                and pm.last_updated
+                and (now_inner - pm.last_updated).total_seconds() > STALE_THRESHOLD_SECONDS
+            )
             km_inactive = (km.status or "").lower() not in ACTIVE_STATUSES
             pm_inactive = (pm.status or "").lower() not in ACTIVE_STATUSES
 
@@ -454,6 +482,13 @@ async def poll_loop() -> None:
 
                 MIN_FRESH_MARKETS = 500
                 is_fresh_kalshi = len(k_markets) >= MIN_FRESH_MARKETS
+                is_fresh_poly = len(p_markets) >= MIN_FRESH_MARKETS
+
+                # Record successful refreshes for staleness gating
+                if is_fresh_kalshi:
+                    _last_successful_refresh["kalshi"] = datetime.utcnow()
+                if is_fresh_poly:
+                    _last_successful_refresh["polymarket"] = datetime.utcnow()
 
                 if not is_fresh_kalshi:
                     # Primary fallback: in-memory cache from last successful collection
