@@ -237,6 +237,10 @@ async def run_market_matching(
 async def detect_arbs() -> list[dict]:
     """Scan all active matched pairs for arb opportunities. Returns new/updated opps."""
     ACTIVE_STATUSES = {"open", "active"}
+    # Markets not refreshed in this many seconds are considered stale/resolved.
+    # Collectors only fetch open markets, so resolved ones simply stop appearing
+    # in API results and their last_updated stops advancing.
+    STALE_THRESHOLD_SECONDS = 15 * 60  # 15 min = 3x the 5-min full refresh cycle
 
     async with AsyncSessionLocal() as session:
         pairs = (
@@ -277,8 +281,15 @@ async def detect_arbs() -> list[dict]:
             if not km or not pm:
                 continue
 
-            # Skip resolved/closed markets — expire any existing opp
-            if (km.status or "").lower() not in ACTIVE_STATUSES or (pm.status or "").lower() not in ACTIVE_STATUSES:
+            # Check if either market is stale (no longer returned by API)
+            now = datetime.utcnow()
+            km_stale = km.last_updated and (now - km.last_updated).total_seconds() > STALE_THRESHOLD_SECONDS
+            pm_stale = pm.last_updated and (now - pm.last_updated).total_seconds() > STALE_THRESHOLD_SECONDS
+            km_inactive = (km.status or "").lower() not in ACTIVE_STATUSES
+            pm_inactive = (pm.status or "").lower() not in ACTIVE_STATUSES
+
+            # Skip resolved/closed/stale markets — expire any existing opp
+            if km_inactive or pm_inactive or km_stale or pm_stale:
                 existing_opp = opp_by_pair.get(pair.id)
                 if existing_opp:
                     await session.execute(
@@ -291,7 +302,16 @@ async def detect_arbs() -> list[dict]:
                         event_type="closed",
                         net_profit_pct=0.0,
                     ))
-                    logger.info(f"Expired opp {existing_opp.id}: market resolved (kalshi={km.status}, poly={pm.status})")
+                    reason = []
+                    if km_inactive:
+                        reason.append(f"kalshi_status={km.status}")
+                    if pm_inactive:
+                        reason.append(f"poly_status={pm.status}")
+                    if km_stale:
+                        reason.append(f"kalshi_stale={km.last_updated}")
+                    if pm_stale:
+                        reason.append(f"poly_stale={pm.last_updated}")
+                    logger.info(f"Expired opp {existing_opp.id}: {', '.join(reason)}")
                 # Also deactivate the matched pair since the market is done
                 await session.execute(
                     update(MatchedPair)
