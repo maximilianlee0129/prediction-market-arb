@@ -47,6 +47,9 @@ class PolymarketCollector:
                 logger.warning(f"Polymarket 429 on {path}, retrying in {delay:.1f}s (attempt {attempt + 1})")
                 await asyncio.sleep(delay)
                 continue
+            if resp.status_code == 422:
+                # Polymarket API hard-caps at 10,000 results; 422 means offset is out of range
+                return []
             resp.raise_for_status()
             return resp.json()
         resp.raise_for_status()
